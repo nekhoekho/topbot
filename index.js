@@ -1,57 +1,45 @@
-// index.js — DB ➜ Discord (tiers only)
-// Requirements:
-//  - players table has columns: discord_id (text), tier (text: T1/T2/T3/T4)
-//  - Bot has Manage Roles and is ABOVE T1–T4 in the role list.
+// index.js — Tiers-only sync (DB -> Discord)
+// Env needed: DISCORD_TOKEN, GUILD_ID, SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 import { Client, GatewayIntentBits, Partials, PermissionsBitField } from "discord.js";
 import { createClient } from "@supabase/supabase-js";
 
-/* ========= ENV ========= */
-const {
-  DISCORD_TOKEN,
-  GUILD_ID,
-  SUPABASE_URL,
-  SUPABASE_SERVICE_KEY,
-} = process.env;
-
+/* ====== ENV ====== */
+const { DISCORD_TOKEN, GUILD_ID, SUPABASE_URL, SUPABASE_SERVICE_KEY } = process.env;
 if (!DISCORD_TOKEN || !GUILD_ID || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.error("Missing env vars. Required: DISCORD_TOKEN, GUILD_ID, SUPABASE_URL, SUPABASE_SERVICE_KEY");
+  console.error("Missing env vars. Need DISCORD_TOKEN, GUILD_ID, SUPABASE_URL, SUPABASE_SERVICE_KEY");
   process.exit(1);
 }
 
-/* ========= CLIENTS ========= */
+/* ====== DISCORD CLIENT ====== */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
   partials: [Partials.GuildMember],
 });
 
+/* ====== SUPABASE ====== */
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-/* ========= YOUR TIER ROLES ========= */
+/* ====== YOUR TIER ROLES ====== */
 const TIER_ROLE_IDS = {
-  T1: "1409930511744368700",
-  T2: "1409930635929456640",
-  T3: "1409930709816184882",
-  T4: "1409930791844315186",
+  1: "1409930511744368700", // T1
+  2: "1409930635929456640", // T2
+  3: "1409930709816184882", // T3
+  4: "1409930791844315186", // T4
 };
-const ALL_TIER_ROLE_IDS = new Set(Object.values(TIER_ROLE_IDS));
+const ALL_TIER_IDS = new Set(Object.values(TIER_ROLE_IDS));
 
-/* ========= HELPERS ========= */
-const norm = v => (v ?? "").toString().trim().toUpperCase();
-
-async function fetchGuild() {
+/* ====== HELPERS ====== */
+async function getGuild() {
   return client.guilds.fetch(GUILD_ID);
 }
-
-async function fetchMember(guild, discordId) {
-  return guild.members.fetch(discordId).catch(() => null);
+async function getMember(guild, id) {
+  return guild.members.fetch(id).catch(() => null);
 }
-
-function desiredTierRoleId(row) {
-  const t = norm(row.tier);
-  return TIER_ROLE_IDS[t] || null; // if invalid/empty, return null (do nothing)
+function isValidTier(val) {
+  const n = typeof val === "string" ? parseInt(val, 10) : val;
+  return n === 1 || n === 2 || n === 3 || n === 4 ? n : null;
 }
-
 function canEditRole(guild, me, roleId) {
   const role = guild.roles.cache.get(roleId);
   if (!role) return false;
@@ -60,62 +48,51 @@ function canEditRole(guild, me, roleId) {
 }
 
 /**
- * Only adjust tier roles:
- * - If DB tier is valid (T1–T4), remove other tier roles and ensure the desired one is present.
- * - If DB tier is empty/unknown, DO NOTHING (leave whatever the user has).
- * We never touch non-tier roles.
+ * Reconcile ONLY tier roles for a single member based on numeric tier.
+ * - tier in {1,2,3,4}: remove other tier roles, add the correct one.
+ * - tier invalid/null: remove ALL tier roles.
  */
-async function reconcileTierRoles(discordId, tierRoleId) {
-  const guild = await fetchGuild();
-  const me = guild.members.me || await guild.members.fetch(client.user.id);
+async function reconcileTier(discordId, tierNumber) {
+  const guild = await getGuild();
+  const me = guild.members.me || (await guild.members.fetch(client.user.id));
   if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-    console.error("Bot missing Manage Roles permission.");
+    console.error("Bot missing Manage Roles permission");
     return;
   }
 
-  const member = await fetchMember(guild, discordId);
+  const member = await getMember(guild, discordId);
   if (!member) return;
 
-  if (!tierRoleId) {
-    // DB has no tier → do nothing (don't strip)
-    return;
+  const currentTierRoles = member.roles.cache.filter(r => ALL_TIER_IDS.has(r.id)).map(r => r.id);
+
+  // Determine desired state
+  const desiredRoleId = tierNumber ? TIER_ROLE_IDS[tierNumber] : null;
+
+  // Build changes, respecting role hierarchy
+  const toRemove = currentTierRoles.filter(id => !desiredRoleId || id !== desiredRoleId)
+    .filter(id => canEditRole(guild, me, id));
+  const toAdd = [];
+  if (desiredRoleId && !member.roles.cache.has(desiredRoleId) && canEditRole(guild, me, desiredRoleId)) {
+    toAdd.push(desiredRoleId);
   }
-
-  // Safety: ensure we can edit desired role
-  if (!canEditRole(guild, me, tierRoleId)) {
-    console.warn(`Cannot add desired tier role ${tierRoleId} (below bot or managed).`);
-    return;
-  }
-
-  // Determine current tier roles on the member
-  const currentTierRoles = member.roles.cache
-    .filter(r => ALL_TIER_ROLE_IDS.has(r.id))
-    .map(r => r.id);
-
-  // Remove tier roles that are not the desired one (and only if we can edit them)
-  const toRemove = currentTierRoles.filter(id => id !== tierRoleId && canEditRole(guild, me, id));
-  const toAdd = member.roles.cache.has(tierRoleId) ? [] : [tierRoleId];
 
   // Apply
   try {
     if (toRemove.length) await member.roles.remove(toRemove);
     if (toAdd.length) await member.roles.add(toAdd);
   } catch (e) {
-    console.error(`reconcileTierRoles(${discordId})`, e);
+    console.error(`reconcileTier(${discordId})`, e);
   }
 }
 
-/**
- * Apply tier from a DB row (tiers only). No other roles touched.
- * Only runs for users present in DB (we never iterate the whole guild).
- */
+/** Apply from a DB row (only if discord_id present) */
 async function applyFromRow(row) {
   if (!row?.discord_id) return;
-  const tierRoleId = desiredTierRoleId(row);
-  await reconcileTierRoles(row.discord_id, tierRoleId);
+  const n = isValidTier(row.tier);
+  await reconcileTier(row.discord_id, n);
 }
 
-/* ========= REALTIME (DB ➜ Discord) ========= */
+/* ====== REALTIME: DB -> Discord ====== */
 async function startRealtime() {
   const channel = supabase.channel("players-tier-sync");
 
@@ -132,27 +109,25 @@ async function startRealtime() {
       }
 
       if (payload.eventType === "UPDATE") {
-        // Only react when tier or discord_id changes
+        // Only react when discord_id or tier changes
         const changed = before.discord_id !== after.discord_id || before.tier !== after.tier;
         if (changed && after.discord_id) await applyFromRow(after);
         return;
       }
 
-      // On DELETE we do nothing (never strip roles for safety)
+      // DELETE: do nothing (never strip due to delete)
     }
   );
 
   await channel.subscribe((status) => console.log("Supabase realtime:", status));
 }
 
-/* ========= STARTUP ========= */
+/* ====== STARTUP: enforce for rows we manage ====== */
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-
-  // Start realtime first
   await startRealtime();
 
-  // One-shot reconciliation for rows we manage: only users present in DB with a tier value.
+  // One-shot pass: only rows with a discord_id (we don't touch anyone else)
   const { data, error } = await supabase
     .from("players")
     .select("discord_id, tier")
@@ -167,5 +142,4 @@ client.once("ready", async () => {
   }
 });
 
-// No guildMemberUpdate, no autolink, no Discord ➜ DB writes.
 client.login(DISCORD_TOKEN);
