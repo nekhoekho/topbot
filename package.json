@@ -1,0 +1,11 @@
+{
+  "name": "top-inhouse-sync-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.43.4",
+    "discord.js": "^14.16.3"
+  }
+}
