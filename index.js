@@ -1,4 +1,4 @@
-// index.js — Tiers-only sync (DB -> Discord, admin-friendly)
+// index.js — Tiers-only sync (DB -> Discord, v14 stable, admin-friendly)
 // Env needed: DISCORD_TOKEN, GUILD_ID, SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 import { Client, GatewayIntentBits, Partials, PermissionsBitField } from "discord.js";
@@ -40,20 +40,20 @@ function isValidTier(val) {
   return [1, 2, 3, 4].includes(n) ? n : null;
 }
 
-/* ====== CORE SYNC ====== */
+/* ====== CORE SYNC (v14: use roles.cache safely) ====== */
 async function reconcileTier(discordId, tierNumber) {
   const guild = await getGuild();
 
-  // Force fresh member fetch to avoid partials
+  // Force fresh member fetch to avoid partials/stale
   const member = await guild.members.fetch({ user: discordId, force: true }).catch(() => null);
   if (!member) return;
 
-  // Explicitly fetch roles (no .cache assumptions)
-  const rolesColl = await member.roles.fetch().catch(() => null);
-  if (!rolesColl) {
+  // Ensure roles manager + cache exist (v14)
+  if (!member.roles || !member.roles.cache) {
     console.warn(`Roles unavailable for ${discordId}; skipping.`);
     return;
   }
+  const rolesColl = member.roles.cache;
 
   // Desired tier role (or none)
   const desiredRoleId = tierNumber ? TIER_ROLE_IDS[tierNumber] : null;
@@ -62,11 +62,11 @@ async function reconcileTier(discordId, tierNumber) {
   const currentTierRoles = rolesColl.filter(r => ALL_TIER_IDS.has(r.id));
   const hasDesired = desiredRoleId ? rolesColl.has(desiredRoleId) : false;
 
-  // No-op short circuits
+  // No-op short circuits (avoid API calls)
   if (!desiredRoleId && currentTierRoles.size === 0) return;
   if (desiredRoleId && currentTierRoles.size === 1 && currentTierRoles.first().id === desiredRoleId) return;
 
-  // Build minimal diff
+  // Minimal diff
   const toRemove = [];
   for (const role of currentTierRoles.values()) {
     if (!desiredRoleId || role.id !== desiredRoleId) toRemove.push(role.id);
@@ -77,6 +77,7 @@ async function reconcileTier(discordId, tierNumber) {
   if (!toRemove.length && !toAdd.length) return;
 
   try {
+    // Admin perms mean hierarchy checks aren’t needed, but this still respects rate limits
     if (toRemove.length) await member.roles.remove(toRemove, "Tier sync: remove old tier(s)");
     if (toAdd.length)    await member.roles.add(toAdd, "Tier sync: add desired tier");
   } catch (e) {
@@ -91,7 +92,7 @@ async function applyFromRow(row) {
   await reconcileTier(row.discord_id, n);
 }
 
-/* ====== REALTIME: DB -> Discord ====== */
+/* ====== REALTIME: DB -> Discord (only when relevant fields change) ====== */
 async function startRealtime() {
   const channel = supabase.channel("players-tier-sync");
 
@@ -108,7 +109,6 @@ async function startRealtime() {
       }
 
       if (payload.eventType === "UPDATE") {
-        // Only react when discord_id or tier changes
         const discordChanged = String(before.discord_id ?? "") !== String(after.discord_id ?? "");
         const tierChanged    = String(before.tier ?? "")       !== String(after.tier ?? "");
         if ((discordChanged || tierChanged) && after.discord_id) {
@@ -117,14 +117,14 @@ async function startRealtime() {
         return;
       }
 
-      // DELETE: do nothing (never strip due to delete)
+      // DELETE: no action (never strip tiers on delete)
     }
   );
 
   await channel.subscribe((status) => console.log("Supabase realtime:", status));
 }
 
-/* ====== STARTUP SYNC ====== */
+/* ====== STARTUP SWEEP (skip no-ops via reconcile short-circuits) ====== */
 async function startupSweep() {
   const { data, error } = await supabase
     .from("players")
@@ -144,6 +144,14 @@ async function startupSweep() {
 /* ====== BOOT ====== */
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+
+  // sanity: ensure we have Manage Roles (admin includes it)
+  const guild = await getGuild();
+  const me = guild.members.me || (await guild.members.fetch(client.user.id));
+  if (!me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+    console.error("Bot missing Manage Roles permission");
+  }
+
   await startRealtime();
   await startupSweep();
 });
