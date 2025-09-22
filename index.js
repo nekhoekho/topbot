@@ -1,10 +1,6 @@
-// index.js — Tiers-only sync (DB -> Discord, v14 stable, admin-friendly)
-// + Missing discord_id audit loop
-// Env needed:
-//   DISCORD_TOKEN, GUILD_ID, SUPABASE_URL, SUPABASE_SERVICE_KEY
-// Optional:
-//   MISSING_IDS_CHANNEL_ID  (Discord text channel to post audits)
-//   MISSING_AUDIT_INTERVAL_MS (default 300000 ms = 5 min)
+// index.js — DB -> Discord Tier Sync (v14)
+// Env required: DISCORD_TOKEN, GUILD_ID, SUPABASE_URL, SUPABASE_SERVICE_KEY
+// Optional: MISSING_IDS_CHANNEL_ID, MISSING_AUDIT_INTERVAL_MS (default 300000 = 5 min)
 
 import {
   Client,
@@ -44,7 +40,7 @@ const client = new Client({
 /* ====== SUPABASE ====== */
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-/* ====== TIER ROLES ====== */
+/* ====== TIER ROLES (replace with yours) ====== */
 const TIER_ROLE_IDS = {
   1: "1409930511744368700", // T1
   2: "1409930635929456640", // T2
@@ -59,36 +55,39 @@ function getGuild() {
   if (!guildPromise) guildPromise = client.guilds.fetch(GUILD_ID);
   return guildPromise;
 }
-function isValidTier(val) {
-  const n = Number.parseInt(val, 10);
+
+// Accept 1..4, "1".."4", "T1".."T4", etc.
+function parseTier(val) {
+  if (val == null) return null;
+  let s = String(val).trim().toUpperCase();
+  if (s.startsWith("T")) s = s.slice(1);
+  const n = Number.parseInt(s, 10);
   return [1, 2, 3, 4].includes(n) ? n : null;
 }
 
-/* ====== CORE SYNC (v14: use roles.cache safely) ====== */
+/* ====== CORE SYNC ====== */
 async function reconcileTier(discordId, tierNumber) {
   const guild = await getGuild();
 
-  // Force fresh member fetch to avoid partials/stale
   const member = await guild.members
     .fetch({ user: discordId, force: true })
-    .catch(() => null);
+    .catch((e) => {
+      console.warn(`Could not fetch member ${discordId}:`, e?.message || e);
+      return null;
+    });
   if (!member) return;
 
-  // Ensure roles manager + cache exist (v14)
   if (!member.roles || !member.roles.cache) {
     console.warn(`Roles unavailable for ${discordId}; skipping.`);
     return;
   }
   const rolesColl = member.roles.cache;
 
-  // Desired tier role (or none)
   const desiredRoleId = tierNumber ? TIER_ROLE_IDS[tierNumber] : null;
-
-  // Current tier roles
   const currentTierRoles = rolesColl.filter((r) => ALL_TIER_IDS.has(r.id));
   const hasDesired = desiredRoleId ? rolesColl.has(desiredRoleId) : false;
 
-  // No-op short circuits (avoid API calls)
+  // No-op cases
   if (!desiredRoleId && currentTierRoles.size === 0) return;
   if (
     desiredRoleId &&
@@ -97,7 +96,6 @@ async function reconcileTier(discordId, tierNumber) {
   )
     return;
 
-  // Minimal diff
   const toRemove = [];
   for (const role of currentTierRoles.values()) {
     if (!desiredRoleId || role.id !== desiredRoleId) toRemove.push(role.id);
@@ -105,10 +103,7 @@ async function reconcileTier(discordId, tierNumber) {
   const toAdd = [];
   if (desiredRoleId && !hasDesired) toAdd.push(desiredRoleId);
 
-  if (!toRemove.length && !toAdd.length) return;
-
   try {
-    // Admin perms mean hierarchy checks aren’t needed
     if (toRemove.length)
       await member.roles.remove(toRemove, "Tier sync: remove old tier(s)");
     if (toAdd.length)
@@ -121,11 +116,17 @@ async function reconcileTier(discordId, tierNumber) {
 /* ====== APPLY FROM ROW ====== */
 async function applyFromRow(row) {
   if (!row?.discord_id) return;
-  const n = isValidTier(row.tier);
-  await reconcileTier(row.discord_id, n);
+  const tierNum = parseTier(row.tier);
+  if (tierNum == null) {
+    console.warn(
+      `Row id:${row.id ?? "?"} has unusable tier value (${row.tier}); leaving roles as-is.`
+    );
+    return;
+  }
+  await reconcileTier(row.discord_id, tierNum);
 }
 
-/* ====== REALTIME: DB -> Discord (only when relevant fields change) ====== */
+/* ====== REALTIME: DB -> Discord ====== */
 async function startRealtime() {
   const channel = supabase.channel("players-tier-sync");
 
@@ -144,39 +145,34 @@ async function startRealtime() {
       if (payload.eventType === "UPDATE") {
         const discordChanged =
           String(before.discord_id ?? "") !== String(after.discord_id ?? "");
-        const tierChanged =
-          String(before.tier ?? "") !== String(after.tier ?? "");
+        const tierBefore = parseTier(before.tier);
+        const tierAfter = parseTier(after.tier);
+        const tierChanged = tierBefore !== tierAfter;
+
         if ((discordChanged || tierChanged) && after.discord_id) {
           await applyFromRow(after);
         }
         return;
       }
 
-      // DELETE: no action (never strip tiers on delete)
+      // DELETE: no action
     }
   );
 
-  await channel.subscribe((status) => console.log("Supabase realtime:", status));
-}
-
-/* ====== MISSING DISCORD_ID AUDIT ====== */
-let lastMissingKey = ""; // stable signature to detect changes
-
-function labelForRow(row) {
-  // Try common name fields; fall back to primary key
-  return (
-    row.player_name ||
-    row.name ||
-    row.in_game_name ||
-    row.ign ||
-    row.username ||
-    row.handle ||
-    `id:${row.id}`
+  await channel.subscribe((status) =>
+    console.log("Supabase realtime:", status)
   );
 }
 
+/* ====== MISSING DISCORD_ID AUDIT ====== */
+let lastMissingKey = "";
+
+function labelForRow(row) {
+  // Only use fields that exist in your schema
+  return row.nickname || row.role || row.current_rank || `id:${row.id}`;
+}
+
 function signatureFor(rows) {
-  // Stable signature to compare lists regardless of order
   return rows
     .map((r) => String(r.id ?? labelForRow(r)))
     .sort()
@@ -186,10 +182,7 @@ function signatureFor(rows) {
 async function fetchMissingDiscordIds() {
   const { data, error } = await supabase
     .from("players")
-    .select(
-      // Try to fetch some label-ish fields if they exist; unknown fields are ignored by Supabase
-      "id, discord_id, tier, player_name, name, in_game_name, ign, username, handle"
-    )
+    .select("id, discord_id, tier, nickname, role, current_rank")
     .is("discord_id", null);
 
   if (error) {
@@ -232,10 +225,7 @@ async function postMissingReport(rows) {
         : sample.join("\n")
     )
     .setFooter({
-      text:
-        total <= 25
-          ? `Total: ${total}`
-          : `Total: ${total} (showing first 25)`,
+      text: total <= 25 ? `Total: ${total}` : `Total: ${total} (showing first 25)`,
     })
     .setTimestamp(new Date());
 
@@ -248,13 +238,10 @@ async function runMissingAuditOnce() {
   if (sig !== lastMissingKey) {
     lastMissingKey = sig;
     await postMissingReport(rows);
-  } else {
-    // unchanged — stay quiet
   }
 }
 
 function startMissingAuditLoop() {
-  // Run immediately, then on interval
   runMissingAuditOnce().catch((e) =>
     console.error("AUDIT first run error:", e)
   );
@@ -263,7 +250,7 @@ function startMissingAuditLoop() {
   }, AUDIT_INTERVAL);
 }
 
-/* ====== STARTUP SWEEP (skip no-ops via reconcile short-circuits) ====== */
+/* ====== STARTUP SWEEP ====== */
 async function startupSweep() {
   const { data, error } = await supabase
     .from("players")
